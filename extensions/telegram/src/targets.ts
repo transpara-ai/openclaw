@@ -1,3 +1,6 @@
+// Telegram plugin module implements targets behavior.
+import { parseStrictNonNegativeInteger } from "openclaw/plugin-sdk/number-runtime";
+
 export type TelegramTarget = {
   chatId: string;
   messageThreadId?: number;
@@ -42,6 +45,15 @@ export function normalizeTelegramChatId(raw: string): string | undefined {
 
 export function isNumericTelegramChatId(raw: string): boolean {
   return TELEGRAM_NUMERIC_CHAT_ID_REGEX.test(raw.trim());
+}
+
+export function normalizeTelegramOutboundTarget(raw: string): string {
+  const trimmed = raw.trim();
+  const legacyGroupMatch = /^group:(-?\d+(?::topic:\d+|:\d+)?)$/i.exec(trimmed);
+  if (legacyGroupMatch?.[1]) {
+    return legacyGroupMatch[1];
+  }
+  return raw;
 }
 
 export function normalizeTelegramLookupTarget(raw: string): string | undefined {
@@ -90,25 +102,17 @@ function resolveTelegramChatType(chatId: string): "direct" | "group" | "unknown"
 
 export function parseTelegramTarget(to: string): TelegramTarget {
   const normalized = stripTelegramInternalPrefixes(to);
-
-  const topicMatch = /^(.+?):topic:(\d+)$/.exec(normalized);
-  if (topicMatch) {
-    return {
-      chatId: topicMatch[1],
-      messageThreadId: Number.parseInt(topicMatch[2], 10),
-      chatType: resolveTelegramChatType(topicMatch[1]),
-    };
+  const match = /^(.+?):topic:(\d+)$/.exec(normalized) ?? /^(.+):(\d+)$/.exec(normalized);
+  if (match) {
+    const chatId = match[1];
+    const threadIdText = match[2];
+    if (chatId !== undefined && threadIdText !== undefined) {
+      const messageThreadId = parseStrictNonNegativeInteger(threadIdText);
+      if (messageThreadId !== undefined) {
+        return { chatId, messageThreadId, chatType: resolveTelegramChatType(chatId) };
+      }
+    }
   }
-
-  const colonMatch = /^(.+):(\d+)$/.exec(normalized);
-  if (colonMatch) {
-    return {
-      chatId: colonMatch[1],
-      messageThreadId: Number.parseInt(colonMatch[2], 10),
-      chatType: resolveTelegramChatType(colonMatch[1]),
-    };
-  }
-
   return {
     chatId: normalized,
     chatType: resolveTelegramChatType(normalized),

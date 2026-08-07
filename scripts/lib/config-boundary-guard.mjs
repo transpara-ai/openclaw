@@ -1,3 +1,4 @@
+// Scans source files for deprecated config API and runtime config-loading boundary violations.
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,14 +8,19 @@ const sourceCache = new Map();
 
 const COMPAT_CONFIG_API_FILES = new Set([
   "src/config/config.ts",
+  "src/config/io.runtime.ts",
   "src/config/io.ts",
   "src/config/mutate.ts",
   "src/memory-host-sdk/runtime-core.ts",
   "src/plugin-sdk/config-runtime.ts",
   "src/plugin-sdk/memory-core-host-runtime-core.ts",
   "src/plugins/compat/registry.ts",
+  "src/plugins/registry.runtime-config.test.ts",
+  "src/plugins/registry.ts",
   "src/plugins/contracts/config-boundary-guard.test.ts",
   "src/plugins/contracts/deprecated-internal-config-api.test.ts",
+  "src/plugins/registry.runtime-config.test.ts",
+  "src/plugins/registry.ts",
   "src/plugins/runtime/runtime-config.test.ts",
   "src/plugins/runtime/runtime-config.ts",
   "src/plugins/runtime/types-core.ts",
@@ -29,6 +35,11 @@ const AMBIENT_RUNTIME_LOAD_CONFIG_COMPAT_FILES = new Set([
 const PROCESS_BOUNDARY_DIRECT_CONFIG_LOAD_FILES = new Set([
   "src/cli/banner-config-lite.ts",
   "src/cli/daemon-cli/status.gather.ts",
+  // `agent exec --config <path>` must load one specific file. `getRuntimeConfig()`
+  // reads the ambient location and resolves from an already published runtime
+  // snapshot, so it cannot express a pinned run; the file-scoped loader is the
+  // point. Ambient resolution in the same command does use `getRuntimeConfig()`.
+  "src/commands/agent-exec.ts",
 ]);
 
 const BROAD_CONFIG_RUNTIME_COMPAT_FILES = new Set([
@@ -36,6 +47,20 @@ const BROAD_CONFIG_RUNTIME_COMPAT_FILES = new Set([
   "src/plugins/bundled-capability-runtime.test.ts",
   "src/plugins/contracts/config-boundary-guard.test.ts",
 ]);
+
+const SEMANTIC_CONFIG_MUTATION_HELPER_FILES = new Set([
+  "extensions/browser/src/browser/config-mutations.ts",
+  "src/auto-reply/reply/config-mutations.ts",
+  "src/gateway/server-methods/agents-config-mutations.ts",
+  "src/gateway/server-methods/config-write-flow.ts",
+  "src/gateway/server-methods/skills-config-mutations.ts",
+]);
+
+const SEMANTIC_CONFIG_MUTATION_SCOPE_PREFIXES = [
+  "extensions/browser/src/browser/",
+  "src/auto-reply/reply/",
+  "src/gateway/server-methods/",
+];
 
 function collectTypeScriptFiles(dir) {
   if (!existsSync(dir)) {
@@ -113,6 +138,13 @@ function isCompatConfigApiFile(relPath) {
 
 function isAmbientRuntimeConfigCompatFile(relPath) {
   return AMBIENT_RUNTIME_LOAD_CONFIG_COMPAT_FILES.has(relPath);
+}
+
+function isSemanticConfigMutationFile(relPath) {
+  return (
+    SEMANTIC_CONFIG_MUTATION_SCOPE_PREFIXES.some((prefix) => relPath.startsWith(prefix)) &&
+    !SEMANTIC_CONFIG_MUTATION_HELPER_FILES.has(relPath)
+  );
 }
 
 function findLineNumbers(source, pattern) {
@@ -204,6 +236,7 @@ function pushBroadConfigRuntimeSpecifierViolations(violations, files) {
   }
 }
 
+/** Collect config-boundary violations for deprecated internal config APIs. */
 export function collectDeprecatedInternalConfigApiViolations({
   repoRoot = DEFAULT_REPO_ROOT,
 } = {}) {
@@ -283,7 +316,7 @@ export function collectDeprecatedInternalConfigApiViolations({
   );
 
   for (const { filePath, relPath } of repoFiles.filter(
-    ({ relPath }) => !isCompatConfigApiFile(relPath),
+    ({ relPath: relPathItem }) => !isCompatConfigApiFile(relPathItem),
   )) {
     const source = readTypeScriptSource(filePath);
     const guards = [
@@ -307,10 +340,10 @@ export function collectDeprecatedInternalConfigApiViolations({
   }
 
   for (const { filePath, relPath } of repoFiles.filter(
-    ({ relPath }) =>
-      !isTestOrHarnessFile(relPath) &&
-      !isCompatConfigApiFile(relPath) &&
-      !relPath.startsWith("test/"),
+    ({ relPath: relPathCandidate }) =>
+      !isTestOrHarnessFile(relPathCandidate) &&
+      !isCompatConfigApiFile(relPathCandidate) &&
+      !relPathCandidate.startsWith("test/"),
   )) {
     const source = readTypeScriptSource(filePath);
     const importPattern =
@@ -333,11 +366,27 @@ export function collectDeprecatedInternalConfigApiViolations({
   }
 
   for (const { filePath, relPath } of repoFiles.filter(
-    ({ relPath }) =>
-      !isTestOrHarnessFile(relPath) &&
-      !isCompatConfigApiFile(relPath) &&
-      !PROCESS_BOUNDARY_DIRECT_CONFIG_LOAD_FILES.has(relPath) &&
-      !relPath.startsWith("test/"),
+    ({ relPath: relPathEntry }) =>
+      !isTestOrHarnessFile(relPathEntry) &&
+      !isCompatConfigApiFile(relPathEntry) &&
+      isSemanticConfigMutationFile(relPathEntry),
+  )) {
+    const source = readTypeScriptSource(filePath);
+    const importPattern =
+      /\bimport\s+\{[\s\S]*?\b(?:mutateConfigFile|mutateConfigFileWithRetry|transformConfigFile|transformConfigFileWithRetry|replaceConfigFile)\b[\s\S]*?\}\s+from\s+["'][^"']*(?:config\/config|config\/mutate)\.js["']/;
+    for (const line of findMatchLineNumbers(source, importPattern)) {
+      violations.push(
+        `${relPath}:${line} use the local domain config mutation helper instead of direct config writes`,
+      );
+    }
+  }
+
+  for (const { filePath, relPath } of repoFiles.filter(
+    ({ relPath: relPathResult }) =>
+      !isTestOrHarnessFile(relPathResult) &&
+      !isCompatConfigApiFile(relPathResult) &&
+      !PROCESS_BOUNDARY_DIRECT_CONFIG_LOAD_FILES.has(relPathResult) &&
+      !relPathResult.startsWith("test/"),
   )) {
     const source = readTypeScriptSource(filePath);
     for (const line of findNonCommentLineNumbers(source, /(?<!\.)\bloadConfig\s*\(/)) {
@@ -353,8 +402,11 @@ export function collectDeprecatedInternalConfigApiViolations({
   }
 
   for (const { filePath, relPath } of collectTypeScriptFiles(gatewayServerMethodsRoot)
-    .map((filePath) => ({ filePath, relPath: repoRelative(repoRoot, filePath) }))
-    .filter(({ relPath }) => !isTestOrHarnessFile(relPath))) {
+    .map((filePathValue) => ({
+      filePath: filePathValue,
+      relPath: repoRelative(repoRoot, filePathValue),
+    }))
+    .filter(({ relPath: relPathValue }) => !isTestOrHarnessFile(relPathValue))) {
     const source = readTypeScriptSource(filePath);
     const importPattern =
       /\bimport\s+\{[\s\S]*?\bloadConfig\b[\s\S]*?\}\s+from\s+["'][^"']*(?:config\/config|config\/io)\.js["']/;
@@ -372,12 +424,15 @@ export function collectDeprecatedInternalConfigApiViolations({
 
   for (const { filePath, relPath } of ambientRuntimeConfigRoots
     .flatMap(collectTypeScriptFiles)
-    .map((filePath) => ({ filePath, relPath: repoRelative(repoRoot, filePath) }))
+    .map((filePathLocal) => ({
+      filePath: filePathLocal,
+      relPath: repoRelative(repoRoot, filePathLocal),
+    }))
     .filter(
-      ({ relPath }) =>
-        !isTestOrHarnessFile(relPath) &&
-        !isCompatConfigApiFile(relPath) &&
-        !isAmbientRuntimeConfigCompatFile(relPath),
+      ({ relPath: relPathLocal }) =>
+        !isTestOrHarnessFile(relPathLocal) &&
+        !isCompatConfigApiFile(relPathLocal) &&
+        !isAmbientRuntimeConfigCompatFile(relPathLocal),
     )) {
     const source = readTypeScriptSource(filePath);
     const loadConfigLines = findNonCommentLineNumbers(source, /(?<!\.)\bloadConfig\s*\(/);
@@ -450,6 +505,7 @@ function isRuntimeActionLoadConfigCandidate(relPath) {
   return RUNTIME_HELPER_BASENAME_PATTERNS.some((pattern) => pattern.test(basename));
 }
 
+/** Collect extension runtime-action files that still load config through forbidden helpers. */
 export function collectRuntimeActionLoadConfigViolations({ repoRoot = DEFAULT_REPO_ROOT } = {}) {
   return collectTypeScriptFiles(resolve(repoRoot, "extensions"))
     .map((filePath) => ({ filePath, relPath: repoRelative(repoRoot, filePath) }))

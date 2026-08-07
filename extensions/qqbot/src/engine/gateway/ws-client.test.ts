@@ -1,3 +1,4 @@
+// Qqbot tests cover ws client plugin behavior.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 const webSocketCtorMock = vi.hoisted(() =>
   vi.fn(function webSocketCtorMockImpl(_url: string, _options?: Record<string, unknown>) {
@@ -5,7 +6,7 @@ const webSocketCtorMock = vi.hoisted(() =>
   }),
 );
 const proxyAgentCtorMock = vi.hoisted(() =>
-  vi.fn(function proxyAgentCtorMockImpl() {
+  vi.fn(function createAmbientNodeProxyAgentMockImpl() {
     return { proxied: true };
   }),
 );
@@ -21,8 +22,16 @@ let createQQWSClient: CreateQQWSClient;
 let priorProxyEnv: Partial<Record<ProxyEnvKey, string | undefined>> = {};
 
 beforeAll(async () => {
-  vi.doMock("proxy-agent", () => ({
-    ProxyAgent: proxyAgentCtorMock,
+  vi.doMock("@openclaw/proxyline", () => ({
+    createAmbientNodeProxyAgent: proxyAgentCtorMock,
+    hasAmbientNodeProxyConfigured: vi.fn(() =>
+      Boolean(
+        process.env.HTTPS_PROXY ??
+        process.env.https_proxy ??
+        process.env.HTTP_PROXY ??
+        process.env.http_proxy,
+      ),
+    ),
   }));
   ({ createQQWSClient } = await import("./ws-client.js"));
 });
@@ -56,7 +65,7 @@ describe("createQQWSClient", () => {
     }
   });
 
-  it("does not set a ws proxy agent when proxy env is absent", async () => {
+  it("sets a bounded handshake without a proxy agent", async () => {
     await createQQWSClient({
       gatewayUrl: "wss://qq.example.test/ws",
       userAgent: "openclaw-qqbot-test",
@@ -68,6 +77,7 @@ describe("createQQWSClient", () => {
       "wss://qq.example.test/ws",
       {
         headers: { "User-Agent": "openclaw-qqbot-test" },
+        handshakeTimeout: 30_000,
       },
     ]);
   });
@@ -87,6 +97,7 @@ describe("createQQWSClient", () => {
       {
         agent: { proxied: true },
         headers: { "User-Agent": "openclaw-qqbot-test" },
+        handshakeTimeout: 30_000,
       },
     ]);
   });
@@ -106,6 +117,7 @@ describe("createQQWSClient", () => {
       {
         agent: { proxied: true },
         headers: { "User-Agent": "openclaw-qqbot-test" },
+        handshakeTimeout: 30_000,
       },
     ]);
   });
@@ -125,6 +137,7 @@ describe("createQQWSClient", () => {
       {
         agent: { proxied: true },
         headers: { "User-Agent": "openclaw-qqbot-test" },
+        handshakeTimeout: 30_000,
       },
     ]);
   });

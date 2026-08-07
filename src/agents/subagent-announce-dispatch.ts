@@ -1,36 +1,79 @@
-type SubagentDeliveryPath = "queued" | "steered" | "direct" | "none";
+/**
+ * Subagent announcement dispatch strategy.
+ *
+ * Completion handoff and requester-visible replies use this to choose between
+ * steering a subagent and directly delivering a message, with phase evidence.
+ */
+type SubagentDeliveryPath = "steered" | "direct" | "queued" | "none";
+type SubagentAnnounceDeliveryDisposition =
+  | "delivered"
+  | "session_queued"
+  | "intentional_non_delivery"
+  | "retryable"
+  | "ambiguous"
+  | "permanent_failure";
+/** Stable reasons an announcement delivery can fail without throwing. */
+type SubagentAnnounceDeliveryFailureReason =
+  | "completion_handoff_pending"
+  | "completion_handoff_unavailable"
+  | "generated_media_missing"
+  | "message_tool_delivery_missing"
+  | "requester_abandoned"
+  | "source_owner_changed"
+  | "visible_reply_missing";
 
-type SubagentAnnounceQueueOutcome = "steered" | "queued" | "none" | "dropped";
+type SubagentAnnounceSteerOutcome =
+  | { status: "steered"; deliveredAt?: number; enqueuedAt?: number }
+  | { status: "none" | "dropped" | "source_owner_changed" };
 
+/** Result of trying to deliver a subagent announcement. */
 export type SubagentAnnounceDeliveryResult = {
   delivered: boolean;
   path: SubagentDeliveryPath;
+  deliveredAt?: number;
+  enqueuedAt?: number;
+  reason?: SubagentAnnounceDeliveryFailureReason;
   error?: string;
+  // Stops fallback delivery when ownership changed or another terminal result
+  // makes trying a second path unsafe.
+  terminal?: boolean;
+  disposition?: SubagentAnnounceDeliveryDisposition;
+  missingMediaUrls?: string[];
   phases?: SubagentAnnounceDispatchPhaseResult[];
 };
 
-type SubagentAnnounceDispatchPhase = "queue-primary" | "direct-primary" | "queue-fallback";
+type SubagentAnnounceDispatchPhase = "steer-primary" | "direct-primary" | "steer-fallback";
 
 type SubagentAnnounceDispatchPhaseResult = {
   phase: SubagentAnnounceDispatchPhase;
   delivered: boolean;
   path: SubagentDeliveryPath;
+  deliveredAt?: number;
+  enqueuedAt?: number;
+  reason?: SubagentAnnounceDeliveryFailureReason;
   error?: string;
 };
 
-export function mapQueueOutcomeToDeliveryResult(
-  outcome: SubagentAnnounceQueueOutcome,
+/** Converts a steer outcome into the shared delivery result shape. */
+function mapSteerOutcomeToDeliveryResult(
+  outcome: SubagentAnnounceSteerOutcome,
 ): SubagentAnnounceDeliveryResult {
-  if (outcome === "steered") {
+  if (outcome.status === "steered") {
     return {
       delivered: true,
       path: "steered",
+      deliveredAt: outcome.deliveredAt,
+      enqueuedAt: outcome.enqueuedAt,
     };
   }
-  if (outcome === "queued") {
+  if (outcome.status === "source_owner_changed") {
     return {
-      delivered: true,
-      path: "queued",
+      delivered: false,
+      path: "none",
+      reason: "source_owner_changed",
+      error: "subagent source lifecycle changed before completion delivery",
+      terminal: true,
+      disposition: "intentional_non_delivery",
     };
   }
   return {
@@ -39,10 +82,12 @@ export function mapQueueOutcomeToDeliveryResult(
   };
 }
 
+/** Runs the ordered steer/direct announcement delivery strategy. */
 export async function runSubagentAnnounceDispatch(params: {
   expectsCompletionMessage: boolean;
+  requireDirectDelivery?: boolean;
   signal?: AbortSignal;
-  queue: () => Promise<SubagentAnnounceQueueOutcome>;
+  steer: () => Promise<SubagentAnnounceSteerOutcome>;
   direct: () => Promise<SubagentAnnounceDeliveryResult>;
 }): Promise<SubagentAnnounceDeliveryResult> {
   const phases: SubagentAnnounceDispatchPhaseResult[] = [];
@@ -54,6 +99,9 @@ export async function runSubagentAnnounceDispatch(params: {
       phase,
       delivered: result.delivered,
       path: result.path,
+      deliveredAt: result.deliveredAt,
+      enqueuedAt: result.enqueuedAt,
+      ...(result.reason ? { reason: result.reason } : {}),
       error: result.error,
     });
   };
@@ -69,15 +117,26 @@ export async function runSubagentAnnounceDispatch(params: {
     });
   }
 
+  if (params.requireDirectDelivery) {
+    // Settle synthesis needs its own delivery turn; steering can inherit a
+    // message-tool-only completion turn and silently suppress the final reply.
+    const primaryDirect = await params.direct();
+    appendPhase("direct-primary", primaryDirect);
+    return withPhases(primaryDirect);
+  }
+
   if (!params.expectsCompletionMessage) {
-    const primaryQueueOutcome = await params.queue();
-    const primaryQueue = mapQueueOutcomeToDeliveryResult(primaryQueueOutcome);
-    appendPhase("queue-primary", primaryQueue);
-    if (primaryQueue.delivered) {
-      return withPhases(primaryQueue);
+    const primarySteerOutcome = await params.steer();
+    const primarySteer = mapSteerOutcomeToDeliveryResult(primarySteerOutcome);
+    appendPhase("steer-primary", primarySteer);
+    if (primarySteer.delivered) {
+      return withPhases(primarySteer);
     }
-    if (primaryQueueOutcome === "dropped") {
-      return withPhases(primaryQueue);
+    if (primarySteer.terminal) {
+      return withPhases(primarySteer);
+    }
+    if (primarySteerOutcome.status === "dropped") {
+      return withPhases(primarySteer);
     }
 
     const primaryDirect = await params.direct();
@@ -85,9 +144,17 @@ export async function runSubagentAnnounceDispatch(params: {
     return withPhases(primaryDirect);
   }
 
+  // Completion handoff prefers direct delivery first so the completion agent's
+  // final visible message wins before falling back to steering.
   const primaryDirect = await params.direct();
   appendPhase("direct-primary", primaryDirect);
-  if (primaryDirect.delivered) {
+  if (
+    primaryDirect.delivered ||
+    primaryDirect.disposition === "session_queued" ||
+    primaryDirect.disposition === "intentional_non_delivery" ||
+    primaryDirect.disposition === "ambiguous" ||
+    primaryDirect.disposition === "permanent_failure"
+  ) {
     return withPhases(primaryDirect);
   }
 
@@ -95,11 +162,14 @@ export async function runSubagentAnnounceDispatch(params: {
     return withPhases(primaryDirect);
   }
 
-  const fallbackQueueOutcome = await params.queue();
-  const fallbackQueue = mapQueueOutcomeToDeliveryResult(fallbackQueueOutcome);
-  appendPhase("queue-fallback", fallbackQueue);
-  if (fallbackQueue.delivered) {
-    return withPhases(fallbackQueue);
+  const fallbackSteerOutcome = await params.steer();
+  const fallbackSteer = mapSteerOutcomeToDeliveryResult(fallbackSteerOutcome);
+  appendPhase("steer-fallback", fallbackSteer);
+  if (fallbackSteer.delivered) {
+    return withPhases(fallbackSteer);
+  }
+  if (fallbackSteer.terminal) {
+    return withPhases(fallbackSteer);
   }
 
   return withPhases(primaryDirect);

@@ -1,0 +1,267 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+import {
+  initializeGlobalHookRunner,
+  resetGlobalHookRunner,
+} from "../../../plugins/hook-runner-global.js";
+import { createMockPluginRegistry } from "../../../plugins/hooks.test-fixtures.js";
+import { createAgentExecutionAttribution } from "../../agent-execution-attribution.js";
+import {
+  bindToolExecutionAttribution,
+  resolveToolExecutionCorrelation,
+} from "../../agent-tools.before-tool-call.attribution.js";
+import type { HookContext } from "../../agent-tools.before-tool-call.js";
+import { applyCodeModeCatalog, createCodeModeTools } from "../../code-mode.js";
+import { resolveConversationCapabilityProfile } from "../../conversation-capability-profile.js";
+import type { ExtensionContext } from "../../sessions/index.js";
+import { createStubTool } from "../../test-helpers/agent-tool-stubs.js";
+import {
+  applyToolSearchCatalog,
+  createToolSearchCatalogRef,
+  resolveToolSearchConfig,
+  TOOL_SEARCH_RAW_TOOL_NAME,
+} from "../../tool-search.js";
+import { prepareEmbeddedAttemptClientTools } from "./attempt-client-tools.js";
+import { bindEmbeddedAttemptExecutionAttribution } from "./attempt-execution-attribution.js";
+import { prepareEmbeddedAttemptToolCatalog } from "./attempt-tool-catalog.js";
+
+const CODE_MODE_CONFIG: OpenClawConfig = { tools: { codeMode: true, toolSearch: false } };
+const TOOL_SEARCH_CONFIG: OpenClawConfig = {
+  tools: { codeMode: false, toolSearch: { enabled: true, mode: "tools" } },
+};
+const CATALOGS_DISABLED_CONFIG: OpenClawConfig = {
+  tools: { codeMode: false, toolSearch: false },
+};
+
+function clientTool(name: string) {
+  return {
+    type: "function" as const,
+    function: { name, description: `client ${name}`, parameters: { type: "object" } },
+  };
+}
+
+/**
+ * Seeds `catalogRef.current` the way the runner does before client tools are
+ * appended; without a registered catalog the append is a no-op and both
+ * branches look identical.
+ */
+function seedCatalog(mode: "code-mode" | "tool-search", config: OpenClawConfig) {
+  const catalogRef = createToolSearchCatalogRef();
+  // A catalog only registers when its own control tools are present, so the
+  // seed has to carry them exactly as the runner's tool surface does.
+  const controlTools =
+    mode === "code-mode"
+      ? createCodeModeTools({
+          config,
+          catalogRef,
+          executeTool: async () => ({ content: [], details: {} }),
+        })
+      : [createStubTool(TOOL_SEARCH_RAW_TOOL_NAME)];
+  const seedParams = {
+    tools: [...controlTools, createStubTool("seeded_target")],
+    config,
+    sessionId: "session",
+    sessionKey: "session-key",
+    agentId: "main",
+    runId: "run",
+    catalogRef,
+  };
+  const seeded =
+    mode === "code-mode" ? applyCodeModeCatalog(seedParams) : applyToolSearchCatalog(seedParams);
+  // Guard the fixture itself: an unregistered catalog would make the append a
+  // no-op and every assertion below would pass for the wrong reason.
+  expect(seeded.catalogRegistered).toBe(true);
+  return catalogRef;
+}
+
+function prepare(input: {
+  codeModeControlsEnabledForRun: boolean;
+  attemptConfig: OpenClawConfig;
+  toolSearchRuntimeConfig: OpenClawConfig;
+  catalogRef: ReturnType<typeof createToolSearchCatalogRef>;
+  catalogToolHookContext?: HookContext;
+}) {
+  return prepareEmbeddedAttemptClientTools({
+    attempt: {
+      config: input.attemptConfig,
+      sessionId: "session",
+      runId: "run",
+    },
+    catalogToolHookContext: input.catalogToolHookContext,
+    codeModeControlsEnabledForRun: input.codeModeControlsEnabledForRun,
+    deferredDirectoryToolsCallable: false,
+    effectiveTools: [],
+    replaySafetyOptions: { declaredReplaySafe: () => undefined },
+    sandboxEnabled: false,
+    sandboxSessionKey: "session-key",
+    sessionAgentId: "main",
+    toolSearchCatalogRef: input.catalogRef,
+    toolSearchRuntimeConfig: input.toolSearchRuntimeConfig,
+    uncompactedEffectiveTools: [],
+    clientTools: [clientTool("client_probe")],
+  } as unknown as Parameters<typeof prepareEmbeddedAttemptClientTools>[0]);
+}
+
+function prepareCatalogHookContext(
+  attribution: ReturnType<typeof createAgentExecutionAttribution>,
+) {
+  const attempt = {
+    config: CATALOGS_DISABLED_CONFIG,
+    model: { api: "openai-responses" },
+    modelId: "test-model",
+    provider: "openai",
+    runId: "flat-run",
+    runtimePlan: { tools: { logDiagnostics: () => {} } },
+    sessionId: "flat-session-id",
+  } as unknown as Parameters<typeof bindEmbeddedAttemptExecutionAttribution>[0];
+  bindEmbeddedAttemptExecutionAttribution(attempt, attribution);
+
+  return prepareEmbeddedAttemptToolCatalog({
+    attempt,
+    preparedToolBase: {
+      codeModeControlsEnabledForRun: false,
+      codeModeSkills: [],
+      effectiveToolsAllow: undefined,
+      forceDirectMessageTool: false,
+      localModelLeanPreserveToolNames: [],
+      runtimeCapabilityProfile: resolveConversationCapabilityProfile({
+        config: CATALOGS_DISABLED_CONFIG,
+        agentId: "flat-agent",
+        sessionKey: "flat-session",
+        sessionId: "flat-session-id",
+        runId: "flat-run",
+      }),
+      toolSearchConfig: resolveToolSearchConfig(CATALOGS_DISABLED_CONFIG),
+      toolSearchControlsEnabledForRun: false,
+      toolSearchRuntimeConfig: CATALOGS_DISABLED_CONFIG,
+      toolsEnabled: false,
+    },
+    bundleTools: {
+      clientTools: [clientTool("client_probe")],
+      uncompactedEffectiveTools: [],
+    },
+    effectiveCwd: "/tmp/workspace",
+    effectiveWorkspace: "/tmp/workspace",
+    sessionAgentId: "flat-agent",
+    sandboxSessionKey: "flat-session",
+    runTrace: {},
+    abortSignal: new AbortController().signal,
+    executeCodeModeTool: async () => ({ content: [], details: {} }),
+    getProviderRuntimeHandle: () => undefined,
+    markStage: () => {},
+  } as unknown as Parameters<typeof prepareEmbeddedAttemptToolCatalog>[0]).catalogToolHookContext;
+}
+
+describe("prepareEmbeddedAttemptClientTools", () => {
+  afterEach(() => {
+    resetGlobalHookRunner();
+  });
+
+  it("hides client tools behind the code-mode catalog when code mode is engaged", () => {
+    const catalogRef = seedCatalog("code-mode", CODE_MODE_CONFIG);
+
+    const result = prepare({
+      codeModeControlsEnabledForRun: true,
+      attemptConfig: CODE_MODE_CONFIG,
+      // Deliberately catalog-disabled: the code-mode branch must not read this.
+      toolSearchRuntimeConfig: CATALOGS_DISABLED_CONFIG,
+      catalogRef,
+    });
+
+    expect(result.clientToolDefs).toEqual([]);
+    expect(result.allCustomTools).toEqual([]);
+  });
+
+  it("hides client tools behind the tool-search catalog when code mode is not engaged", () => {
+    const catalogRef = seedCatalog("tool-search", TOOL_SEARCH_CONFIG);
+
+    const result = prepare({
+      codeModeControlsEnabledForRun: false,
+      // Deliberately catalog-disabled: the tool-search branch must not read this.
+      attemptConfig: CATALOGS_DISABLED_CONFIG,
+      toolSearchRuntimeConfig: TOOL_SEARCH_CONFIG,
+      catalogRef,
+    });
+
+    expect(result.clientToolDefs).toEqual([]);
+    expect(result.allCustomTools).toEqual([]);
+  });
+
+  it("keeps client tools directly callable when neither catalog is engaged", () => {
+    const catalogRef = seedCatalog("tool-search", TOOL_SEARCH_CONFIG);
+
+    const result = prepare({
+      codeModeControlsEnabledForRun: false,
+      attemptConfig: TOOL_SEARCH_CONFIG,
+      toolSearchRuntimeConfig: CATALOGS_DISABLED_CONFIG,
+      catalogRef,
+    });
+
+    expect(result.clientToolDefs.map((tool) => tool.name)).toEqual(["client_probe"]);
+  });
+
+  it("binds admitted attribution privately in the attempt tool catalog", () => {
+    const attribution = createAgentExecutionAttribution({
+      runId: "admitted-run",
+      lifecycleGeneration: "admitted-generation",
+      sessionKey: "admitted-session",
+      sessionId: "admitted-session-id",
+      agentId: "admitted-agent",
+    });
+    const catalogToolHookContext = prepareCatalogHookContext(attribution);
+
+    expect(catalogToolHookContext).not.toHaveProperty("attribution");
+    expect(resolveToolExecutionCorrelation(catalogToolHookContext)).toEqual({
+      runId: attribution.runId,
+      contextId: attribution.contextId,
+      executionId: attribution.executionId,
+      lifecycleGeneration: attribution.lifecycleGeneration,
+      sessionKey: attribution.sessionKey,
+      sessionId: attribution.sessionId,
+      agentId: attribution.agentId,
+    });
+  });
+
+  it("uses admitted attribution for direct client-tool hook correlation", async () => {
+    const beforeToolCall = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "before_tool_call", handler: beforeToolCall }]),
+    );
+    const attribution = createAgentExecutionAttribution({
+      runId: "admitted-run",
+      lifecycleGeneration: "admitted-generation",
+      sessionKey: "admitted-session",
+      sessionId: "admitted-session-id",
+      agentId: "admitted-agent",
+    });
+    const result = prepare({
+      codeModeControlsEnabledForRun: false,
+      attemptConfig: TOOL_SEARCH_CONFIG,
+      toolSearchRuntimeConfig: CATALOGS_DISABLED_CONFIG,
+      catalogRef: seedCatalog("tool-search", TOOL_SEARCH_CONFIG),
+      catalogToolHookContext: bindToolExecutionAttribution(
+        {
+          runId: "flat-run",
+          sessionKey: "flat-session",
+          sessionId: "flat-session-id",
+          agentId: "flat-agent",
+        },
+        attribution,
+      ),
+    });
+    const directClientTool = result.clientToolDefs[0];
+    if (!directClientTool) {
+      throw new Error("expected direct client tool");
+    }
+
+    await directClientTool.execute("client-call", {}, undefined, undefined, {} as ExtensionContext);
+
+    expect(beforeToolCall.mock.calls[0]?.[1]).toMatchObject({
+      runId: "admitted-run",
+      sessionKey: "admitted-session",
+      sessionId: "admitted-session-id",
+      agentId: "admitted-agent",
+    });
+    expect(beforeToolCall.mock.calls[0]?.[1]).not.toHaveProperty("lifecycleGeneration");
+  });
+});

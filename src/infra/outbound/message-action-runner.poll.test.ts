@@ -1,5 +1,7 @@
+// Covers message-action poll handling through plugin dispatch and core gateway
+// poll fallback.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ChannelPlugin } from "../../channels/plugins/types.js";
+import type { ChannelPlugin } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { getActivePluginRegistry, setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
@@ -103,12 +105,14 @@ async function runPollAction(params: {
   cfg: OpenClawConfig;
   actionParams: Record<string, unknown>;
   toolContext?: Record<string, unknown>;
+  inboundEventKind?: "user_request" | "room_event";
 }) {
   await runMessageAction({
     cfg: params.cfg,
     action: "poll",
     params: params.actionParams as never,
     toolContext: params.toolContext as never,
+    inboundEventKind: params.inboundEventKind,
   });
   const call = firstMockArg(mocks.executePollAction, "executePollAction") as {
     resolveCorePoll?: () => {
@@ -116,7 +120,11 @@ async function runPollAction(params: {
       maxSelections?: number;
       threadId?: string;
     };
-    ctx?: { params?: Record<string, unknown> };
+    ctx?: {
+      inboundEventKind?: string;
+      idempotencyKey?: string;
+      params?: Record<string, unknown>;
+    };
   };
   return {
     ...call.resolveCorePoll?.(),
@@ -187,6 +195,54 @@ describe("runMessageAction poll handling", () => {
     expect(call?.durationHours).toBe(2);
     expect(call?.threadId).toBe("42");
     expect(call?.ctx?.params?.threadId).toBe("42");
+  });
+
+  it.each([0, -1, 1.5, "1.5", "soon"])(
+    "rejects invalid pollDurationHours value %s",
+    async (pollDurationHours) => {
+      await expect(
+        runPollAction({
+          cfg: pollerConfig,
+          actionParams: {
+            channel: "poller",
+            target: "poller:123",
+            pollQuestion: "Lunch?",
+            pollOption: ["Pizza", "Sushi"],
+            pollDurationHours,
+          },
+        }),
+      ).rejects.toThrow(/pollDurationHours must be a positive integer/i);
+    },
+  );
+
+  it("passes inbound event kind to poll execution", async () => {
+    const call = await runPollAction({
+      cfg: pollerConfig,
+      actionParams: {
+        channel: "poller",
+        target: "poller:123",
+        pollQuestion: "Lunch?",
+        pollOption: ["Pizza", "Sushi"],
+      },
+      inboundEventKind: "room_event",
+    });
+
+    expect(call?.ctx?.inboundEventKind).toBe("room_event");
+  });
+
+  it("copies the normalized idempotency key into poll execution context", async () => {
+    const call = await runPollAction({
+      cfg: pollerConfig,
+      actionParams: {
+        channel: "poller",
+        target: "poller:123",
+        pollQuestion: "Lunch?",
+        pollOption: ["Pizza", "Sushi"],
+        idempotencyKey: " run-1:message-tool:poll-1:fingerprint ",
+      },
+    });
+
+    expect(call?.ctx?.idempotencyKey).toBe("run-1:message-tool:poll-1:fingerprint");
   });
 
   it("expands maxSelections when pollMulti is enabled", async () => {

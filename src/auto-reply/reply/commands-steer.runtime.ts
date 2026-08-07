@@ -1,6 +1,7 @@
+// Runtime barrel for embedded-agent steering helpers used by auto-reply commands.
 export {
-  formatEmbeddedPiQueueFailureSummary,
-  isEmbeddedPiRunActive,
-  queueEmbeddedPiMessageWithOutcome,
+  formatEmbeddedAgentQueueFailureSummary,
+  isEmbeddedAgentRunActive,
+  queueEmbeddedAgentMessageWithOutcomeAsync,
   resolveActiveEmbeddedRunSessionId,
-} from "../../agents/pi-embedded-runner/runs.js";
+} from "../../agents/embedded-agent-runner/runs.js";

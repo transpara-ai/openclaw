@@ -1,3 +1,4 @@
+// Status overview row tests cover status-all overview values, update metadata, and display rows.
 import { describe, expect, it } from "vitest";
 import { VERSION } from "../version.js";
 import {
@@ -40,6 +41,39 @@ describe("status-overview-rows", () => {
     );
   });
 
+  it("shows update restart state in fast status output", () => {
+    const rows = buildStatusCommandOverviewRows(
+      createStatusCommandOverviewRowsParams({
+        updateRestartValue: "failed · managed-service-handoff-failed",
+      }),
+    );
+
+    expect(findRowValue(rows, "Update restart")).toBe("failed · managed-service-handoff-failed");
+  });
+
+  it("lists plugins quarantined as configured-unavailable", () => {
+    const rows = buildStatusCommandOverviewRows(
+      createStatusCommandOverviewRowsParams({
+        summary: {
+          ...createStatusCommandOverviewRowsParams().summary,
+          degradedPlugins: [
+            {
+              pluginId: "discord",
+              state: "configured-unavailable",
+              diagnostic: {
+                kind: "plugin-verification",
+                reason: "unreadable-package-json",
+                detail: "permission denied",
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(findRowValue(rows, "Degraded plugins")).toBe("warn(1 configured-unavailable · discord)");
+  });
+
   it("builds status-all overview rows from the shared surface", () => {
     const rows = buildStatusAllOverviewRows({
       surface: {
@@ -51,6 +85,7 @@ describe("status-overview-rows", () => {
       osLabel: "macOS",
       configPath: "/tmp/openclaw.json",
       secretDiagnosticsCount: 2,
+      updateRestartValue: "restart pending health verification",
       agentStatus: {
         bootstrapPendingCount: 1,
         totalSessions: 2,
@@ -62,6 +97,7 @@ describe("status-overview-rows", () => {
     expect(findRowValue(rows, "Version")).toBe(VERSION);
     expect(findRowValue(rows, "OS")).toBe("macOS");
     expect(findRowValue(rows, "Config")).toBe("/tmp/openclaw.json");
+    expect(findRowValue(rows, "Update restart")).toBe("restart pending health verification");
     expect(findRowValue(rows, "Security")).toBe("Run: openclaw security audit --deep");
     expect(findRowValue(rows, "Secrets")).toBe("2 diagnostics");
   });

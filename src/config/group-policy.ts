@@ -1,10 +1,12 @@
-import type { ChannelId } from "../channels/plugins/channel-id.types.js";
-import { resolveAccountEntry } from "../routing/account-lookup.js";
-import { normalizeAccountId } from "../routing/session-key.js";
+// Normalizes group-policy config for channel and runtime decisions.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
-} from "../shared/string-coerce.js";
+} from "@openclaw/normalization-core/string-coerce";
+import type { ChannelId } from "../channels/plugins/channel-id.types.js";
+import { createDedupeCache } from "../infra/dedupe.js";
+import { resolveAccountEntry } from "../routing/account-lookup.js";
+import { normalizeAccountId } from "../routing/session-key.js";
 import { normalizeMessageChannel } from "../utils/message-channel-core.js";
 import type { OpenClawConfig } from "./types.openclaw.js";
 import {
@@ -58,6 +60,8 @@ function resolveChannelGroupConfig(
 }
 
 type GroupToolPolicySender = {
+  /** Skip sender-specific overlays for trusted non-ingress executions. */
+  senderPolicyMode?: "always" | "never";
   messageProvider?: string | null;
   senderId?: string | null;
   senderName?: string | null;
@@ -71,7 +75,12 @@ type CompiledSenderPolicy = {
   wildcard?: GroupToolPolicyConfig;
 };
 
-const warnedLegacyToolsBySenderKeys = new Set<string>();
+const MAX_WARNED_LEGACY_TOOLS_BY_SENDER_KEYS = 4096;
+// Warning state spans fresh config snapshots; bounding it means evicted legacy keys can re-warn.
+const warnedLegacyToolsBySenderKeys = createDedupeCache({
+  ttlMs: 0,
+  maxSize: MAX_WARNED_LEGACY_TOOLS_BY_SENDER_KEYS,
+});
 const compiledToolsBySenderCache = new WeakMap<
   GroupToolPolicyBySenderConfig,
   CompiledSenderPolicy
@@ -136,10 +145,9 @@ function normalizeLegacySenderKey(value: string): string {
 
 function warnLegacyToolsBySenderKey(rawKey: string) {
   const trimmed = rawKey.trim();
-  if (!trimmed || warnedLegacyToolsBySenderKeys.has(trimmed)) {
+  if (!trimmed || warnedLegacyToolsBySenderKeys.check(trimmed)) {
     return;
   }
-  warnedLegacyToolsBySenderKeys.add(trimmed);
   process.emitWarning(
     `toolsBySender key "${trimmed}" is deprecated. Use explicit prefixes (channel:, id:, e164:, username:, name:). Legacy unprefixed keys are matched as id only.`,
     {
@@ -324,7 +332,7 @@ export function resolveToolsBySender(
   return matchToolsBySenderPolicy(compiled, params);
 }
 
-function resolveChannelGroups(
+export function resolveChannelGroups(
   cfg: OpenClawConfig,
   channel: GroupPolicyChannel,
   accountId?: string | null,
@@ -340,6 +348,21 @@ function resolveChannelGroups(
     return undefined;
   }
   const accountGroups = resolveAccountEntry(channelConfig.accounts, normalizedAccountId)?.groups;
+  // In a single-account setup, treat an explicit empty account groups map
+  // (`accounts.<id>.groups: {}`) the same as undefined for fallback: the empty
+  // literal is almost always a config-migration artifact, not an intentional
+  // "block all groups" declaration — the explicit way to block is
+  // `groupPolicy: "disabled"` (or omitting the group from a populated
+  // allowlist). Without this, an empty `{}` paired with the default
+  // `groupPolicy: "allowlist"` silently denies every group update even though
+  // root `channels.<channel>.groups` is populated. Multi-account contexts keep
+  // the existing semantics so per-account explicit-empty groups still scope
+  // disable a single account without affecting siblings.
+  const isMultiAccount = Object.keys(channelConfig.accounts ?? {}).length > 1;
+  if (!isMultiAccount) {
+    const hasAccountGroups = accountGroups && Object.keys(accountGroups).length > 0;
+    return hasAccountGroups ? accountGroups : channelConfig.groups;
+  }
   return accountGroups ?? channelConfig.groups;
 }
 
@@ -465,28 +488,34 @@ export function resolveChannelGroupToolsPolicy(
     }
   }
   const defaultConfig = groups?.["*"];
-  const groupSenderPolicy = resolveToolsBySender({
-    toolsBySender: groupConfig?.toolsBySender,
-    messageProvider: params.messageProvider ?? params.channel,
-    senderId: params.senderId,
-    senderName: params.senderName,
-    senderUsername: params.senderUsername,
-    senderE164: params.senderE164,
-  });
+  const groupSenderPolicy =
+    params.senderPolicyMode === "never"
+      ? undefined
+      : resolveToolsBySender({
+          toolsBySender: groupConfig?.toolsBySender,
+          messageProvider: params.messageProvider ?? params.channel,
+          senderId: params.senderId,
+          senderName: params.senderName,
+          senderUsername: params.senderUsername,
+          senderE164: params.senderE164,
+        });
   if (groupSenderPolicy) {
     return groupSenderPolicy;
   }
   if (groupConfig?.tools) {
     return groupConfig.tools;
   }
-  const defaultSenderPolicy = resolveToolsBySender({
-    toolsBySender: defaultConfig?.toolsBySender,
-    messageProvider: params.messageProvider ?? params.channel,
-    senderId: params.senderId,
-    senderName: params.senderName,
-    senderUsername: params.senderUsername,
-    senderE164: params.senderE164,
-  });
+  const defaultSenderPolicy =
+    params.senderPolicyMode === "never"
+      ? undefined
+      : resolveToolsBySender({
+          toolsBySender: defaultConfig?.toolsBySender,
+          messageProvider: params.messageProvider ?? params.channel,
+          senderId: params.senderId,
+          senderName: params.senderName,
+          senderUsername: params.senderUsername,
+          senderE164: params.senderE164,
+        });
   if (defaultSenderPolicy) {
     return defaultSenderPolicy;
   }
