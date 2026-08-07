@@ -56,3 +56,7 @@
 /scripts/openclaw-npm-publish.sh @openclaw/openclaw-release-managers
 /scripts/openclaw-npm-release-check.ts @openclaw/openclaw-release-managers
 /scripts/release-check.ts @openclaw/openclaw-release-managers
+
+# TLC 4.5 governance ownership
+/.governance/tlc/ @MichaelSaucier
+/.github/workflows/tlc-4.5.yml @MichaelSaucier
